@@ -1,0 +1,255 @@
+import cv2
+import numpy as np
+import os
+from picamera2 import Picamera2
+from datetime import datetime, timedelta
+import csv
+import json
+import time
+import requests
+
+# -------------------------------
+# PATHS
+# -------------------------------
+EMB_PATH = "/home/fypsquad/Desktop/embeddings.npy"
+NAME_PATH = "/home/fypsquad/Desktop/names.npy"
+ATTENDANCE_DIR = "/home/fypsquad/Desktop/attendance"
+MODELS_PATH = "/home/fypsquad/Desktop/models"
+
+os.makedirs(ATTENDANCE_DIR, exist_ok=True)
+
+# -------------------------------
+# API CONFIG
+# -------------------------------
+API_URL = "http://192.168.0.100:5000/api/attendance/events"
+LOGS_API_URL = "http://192.168.0.100:5000/api/logs"
+DEVICE_ID = "pi1"
+
+# -------------------------------
+# ROLL MAP
+# -------------------------------
+ROLL_MAP = {
+"Mutaal":"22001","Rafay":"22002","Ahtisham":"22004","Sufyan":"22005",
+"Adil":"22018","Ahmed":"22017","Anas":"22019","Anza":"22020",
+"Azher":"22021","Hassan":"22011","Huzaifa":"22012","Janeed":"22022",
+"Mazhar":"22016","Mujtaba":"22032","Munawar":"22033","Musab":"22024",
+"Saad Ismail":"21028","Saad Sheikh":"22034","Saim":"22026",
+"Shabib":"22041","Shajee":"22038","Shakeel":"22039","Umer":"21030",
+"Uzair":"22029","Waleed":"22030","Wasif":"22048","Yousuf":"22031"
+}
+
+# -------------------------------
+# FILE
+# -------------------------------
+today = datetime.now().strftime("%Y-%m-%d")
+csv_path = os.path.join(ATTENDANCE_DIR, f"{today}.csv")
+json_path = os.path.join(ATTENDANCE_DIR, f"{today}.json")
+
+attendance_data = {}
+logs_data = []
+detect_count = {}
+
+# -------------------------------
+# LOAD OLD LOGS (IMPORTANT)
+# -------------------------------
+if os.path.exists(json_path):
+    try:
+        with open(json_path, "r") as f:
+            logs_data = json.load(f)
+
+        # restore counts
+        for log in logs_data:
+            detect_count[log["name"]] = max(
+                detect_count.get(log["name"], 0),
+                log["count"]
+            )
+    except:
+        logs_data = []
+
+# -------------------------------
+# CLEAN OLD FILES
+# -------------------------------
+now = datetime.now()
+for f in os.listdir(ATTENDANCE_DIR):
+    path = os.path.join(ATTENDANCE_DIR, f)
+    if os.path.isfile(path):
+        if now - datetime.fromtimestamp(os.path.getctime(path)) > timedelta(days=2):
+            os.remove(path)
+
+# -------------------------------
+# LOAD MODELS
+# -------------------------------
+detector = cv2.FaceDetectorYN_create(
+    os.path.join(MODELS_PATH, "face_detection_yunet_2023mar.onnx"),
+    "",
+    (640, 480)
+)
+
+recognizer = cv2.FaceRecognizerSF_create(
+    os.path.join(MODELS_PATH, "face_recognition_sface_2021dec.onnx"),
+    ""
+)
+
+detector.setInputSize((640, 480))
+
+# -------------------------------
+# LOAD EMBEDDINGS
+# -------------------------------
+embeddings = np.load(EMB_PATH)
+names = np.load(NAME_PATH)
+embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+
+# -------------------------------
+# CAMERA
+# -------------------------------
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(
+    main={"format": "RGB888", "size": (640, 480)}
+)
+picam2.configure(config)
+picam2.start()
+
+# -------------------------------
+# MEMORY SYSTEM (FIXED)
+# -------------------------------
+present_now = set()
+last_absent_time = {}
+ABSENCE_TIME = 5
+
+FRAME_SKIP = 2
+frame_count = 0
+
+# -------------------------------
+# MAIN LOOP
+# -------------------------------
+while True:
+
+    frame = picam2.capture_array()
+    frame = cv2.rotate(frame, cv2.ROTATE_180)
+
+    frame_count += 1
+    if frame_count % FRAME_SKIP != 0:
+        continue
+
+    current_detected = set()
+
+    _, faces = detector.detect(frame)
+
+    if faces is not None:
+
+        for f in faces:
+
+            x, y, w, h = f[:4].astype(int)
+
+            aligned = recognizer.alignCrop(frame, f)
+            emb = recognizer.feature(aligned)
+
+            emb = emb.flatten()
+            emb = emb / np.linalg.norm(emb)
+
+            sims = np.dot(embeddings, emb)
+            idx = np.argmax(sims)
+            conf = float(sims[idx])
+
+            name = names[idx] if conf > 0.65 else "Unknown"
+
+            if name != "Unknown":
+                current_detected.add(name)
+
+                if name not in present_now:
+
+                    now_time = time.time()
+
+                    if name not in last_absent_time or \
+                       now_time - last_absent_time[name] > ABSENCE_TIME:
+
+                        print("[ENTRY]", name)
+
+                        roll = ROLL_MAP.get(name, "N/A")
+                        date_str = datetime.now().strftime("%Y-%m-%d")
+                        time_str = datetime.now().strftime("%H:%M:%S")
+
+                        # ATTENDANCE (ONCE)
+                        if roll not in attendance_data:
+                            attendance_data[roll] = {
+                                "roll_no": roll,
+                                "name": name,
+                                "date": date_str,
+                                "time": time_str,
+                                "confidence": conf,
+                                "status": "Present"
+                            }
+
+                            try:
+                                requests.post(API_URL, json={
+                                    "roll_no": roll,
+                                    "name": name,
+                                    "date": date_str,
+                                    "time": time_str,
+                                    "confidence": float(conf),
+                                    "status": "Present",
+                                    "device_id": DEVICE_ID
+                                }, timeout=0.5)
+                            except:
+                                pass
+
+                        # COUNT
+                        detect_count[name] = detect_count.get(name, 0) + 1
+
+                        log_entry = {
+                            "roll_no": roll,
+                            "name": name,
+                            "date": date_str,
+                            "time": time_str,
+                            "count": detect_count[name],
+                            "device_id": DEVICE_ID
+                        }
+
+                        logs_data.append(log_entry)
+
+                        # API LOG (CORRECT FORMAT)
+                        try:
+                            requests.post(LOGS_API_URL, json=log_entry, timeout=0.5)
+                        except:
+                            pass
+
+                        # SAVE CSV
+                        with open(csv_path, "w", newline="") as f:
+                            writer = csv.writer(f)
+                            writer.writerow(["Roll No","Name","Date","Time","Count"])
+                            for log in logs_data:
+                                writer.writerow([
+                                    log["roll_no"],
+                                    log["name"],
+                                    log["date"],
+                                    log["time"],
+                                    log["count"]
+                                ])
+
+                        # SAVE JSON
+                        with open(json_path, "w") as f:
+                            json.dump(logs_data, f, indent=4)
+
+                present_now.add(name)
+
+            # DRAW
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.putText(frame, f"{name} ({conf:.2f})",
+                        (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+    # EXIT DETECT
+    for name in list(present_now):
+        if name not in current_detected:
+            last_absent_time[name] = time.time()
+            present_now.remove(name)
+
+    cv2.imshow("FINAL FYP SYSTEM", frame)
+
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+    time.sleep(0.01)
+
+picam2.stop()
+cv2.destroyAllWindows()
